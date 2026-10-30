@@ -40,7 +40,7 @@ import org.bukkit.inventory.ItemStack;
  *       <b>概率产出与 noConsume 语义原样保留</b> → 进 {@code STACKMACHINE_LIST}。</li>
  * </ol>
  *
- * <h2>四条纪律</h2>
+ * <h2>五条纪律</h2>
  * <ul>
  *   <li><b>只追加、不重排</b>：绝不从 LogiTech 的表里 {@code remove} 任何条目
  *       （删除会让后续条目下标前移，老存档里 {@code craftType} 会串机）。</li>
@@ -52,18 +52,33 @@ import org.bukkit.inventory.ItemStack;
  *       与多方块核心机器（{@code TTSuperMultiBlockMachine}）一律不登记——
  *       前者产能来自 NativeScript 的 tick 钩子、后者依赖结构成形与核心朝向，
  *       堆叠机只认「输入槽 + 配方 + 耗电」，登进去等于绕过玩法约束。</li>
+ *   <li><b>绝不提前初始化对方的类</b>（v2.1.3 教训）：对方的配方供应器把重活放在静态块里，
+ *       靠「第 1 tick 才首次 touch」来保证「全体附属注册完毕之后才快照」。只要我们在
+ *       {@code onEnable} 里 {@code Class.forName} 一次（默认 {@code initialize=true}），
+ *       扫描就会提前到「其他附属还没注册」的时点，<b>晚于本插件 enable 的附属配方会整批缺席，
+ *       而且第 1 tick 的 {@code init()} 是空方法，永远补不回来</b>。
+ *       因此探测一律用 {@code Class.forName(name, false, loader)}，真正读表只在
+ *       {@link #postRegisterDone()} 为真之后。</li>
  * </ul>
  */
 public final class LogiTechStackBridge {
 
     private static final String RS = "me.matl114.logitech.core.Registries.RecipeSupporter";
     private static final String MRU = "me.matl114.logitech.utils.MachineRecipeUtils";
+    private static final String MGEN = "me.matl114.logitech.utils.UtilClass.RecipeClass.MGeneratorRecipe";
+    private static final String PST = "me.matl114.logitech.manager.PostSetupTasks";
 
     private static boolean probed;
     private static boolean available;
-    /** 探测中标记：逻辑工艺自己的静态初始化会回调 {@code getMachineRecipes()}，
-     *  从而重入到本类的 {@link #resolve()}；此时不能把「半初始化」当成结论缓存。 */
-    private static boolean resolving;
+
+    /** {@link #classPresent()} 的缓存（未装逻辑工艺时只探测一次）。 */
+    private static boolean classChecked;
+    private static boolean classExists;
+
+    /** 逻辑工艺 post-register 标志的解析状态（{@link #postRegisterDone()}）。 */
+    private static boolean pstResolved;
+    private static boolean pstMissing;
+    private static Field fPostRegister;
 
     private static Field fRecipeList;      // RecipeSupporter.MACHINE_RECIPELIST
     private static Field fMachineList;     // RecipeSupporter.STACKMACHINE_LIST
@@ -80,39 +95,84 @@ public final class LogiTechStackBridge {
     public static boolean available() {
         if (!probed) {
             synchronized (LogiTechStackBridge.class) {
-                if (!probed) {
-                    if (resolving) return false;   // 重入（对方静态初始化回调过来的）：本次不给结论，也不缓存
-                    resolving = true;
-                    boolean settled;
-                    try {
-                        settled = resolve();
-                    } finally {
-                        resolving = false;
-                    }
-                    if (settled) probed = true;
-                }
+                if (!probed) probed = resolve();
             }
         }
         return available;
     }
 
-    /** 探测已完成且成功——只有此时才允许把转换结果写进缓存。 */
+    /** 探测已完成、且对方已进入 post-register 阶段——只有此时才允许把转换结果写进缓存。 */
     public static boolean ready() {
-        return available() && probed && !resolving;
+        return available() && postRegisterDone();
+    }
+
+    /**
+     * 逻辑工艺是否已进入它自己的 post-register 阶段（= 配方供应器扫描的起点）。
+     *
+     * <p>对方 {@code PostSetupTasks.schedulePostRegister()} 是「<b>先把
+     * {@code startPostRegister} 置 true，再调 {@code RecipeSupporter.init()} 触发静态块扫描」，
+     * 所以这个标志为真，就说明扫描已经开始或已经结束，此刻碰它的配方表不会再打乱时序。</p>
+     *
+     * <p>只读 {@code PostSetupTasks} 的布尔字段：该类的静态初始化只有一个 {@code HashSet}
+     * 与两个 boolean，<b>不会</b>连带触发 {@code RecipeSupporter} 的静态块。</p>
+     */
+    public static boolean postRegisterDone() {
+        if (!pstResolved) {
+            try {
+                Class<?> c = Class.forName(PST, false, LogiTechStackBridge.class.getClassLoader());
+                fPostRegister = c.getField("startPostRegister");
+            } catch (Throwable t) {
+                pstMissing = true;
+            }
+            pstResolved = true;
+        }
+        if (pstMissing) return false;
+        try {
+            return Boolean.TRUE.equals(fPostRegister.get(null));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 对方的 post-register 标志是否拿不到（版本字段名差异）——此时只能按时间兜底。 */
+    public static boolean postRegisterFlagMissing() {
+        postRegisterDone();
+        return pstMissing;
+    }
+
+    /** 只判对方的类是否存在，<b>不</b>触发它初始化（{@code initialize=false}）；结果缓存一次。 */
+    public static boolean classPresent() {
+        if (!classChecked) {
+            try {
+                Class.forName(RS, false, LogiTechStackBridge.class.getClassLoader());
+                classExists = true;
+            } catch (Throwable t) {
+                classExists = false;
+            }
+            classChecked = true;
+        }
+        return classExists;
     }
 
     /**
      * 反射探测。
      *
-     * @return {@code true} 表示「已有结论」（成功，或插件的类压根不存在这类硬失败，不必重试）；
-     *         {@code false} 表示「暂时拿不到结论」（例如正被对方的静态初始化重入，
-     *         静态表还是 null），此时不写 {@code probed}，留给下一次调用重新探测。
+     * <p>两道保险：① 没有 {@link #classPresent()} 就返回 {@code false}，绝不 throw；
+     * ② <b>对方还没进入 post-register 阶段时一律不探</b>（返回 {@code false} 且不写
+     * {@code probed}）—— {@code Class.forName(..)} 默认会初始化类，提前初始化会把对方
+     * 「等全体附属注册完再扫描」的快照时机整体打乱。</p>
+     *
+     * @return {@code true} 表示「已有结论」（成功，或类压根不存在这类硬失败，不必重试）；
+     *         {@code false} 表示「暂时还没有结论」（对方未到 post-register、或静态表尚未就绪），
+     *         下次调用重新探测。
      */
     private static boolean resolve() {
+        if (!postRegisterDone()) return false;
+        ClassLoader cl = LogiTechStackBridge.class.getClassLoader();
         try {
-            Class<?> rs = Class.forName(RS);
-            Class<?> mru = Class.forName(MRU);
-            genClass = Class.forName("me.matl114.logitech.utils.UtilClass.RecipeClass.MGeneratorRecipe");
+            Class<?> rs = Class.forName(RS, false, cl);
+            Class<?> mru = Class.forName(MRU, false, cl);
+            genClass = Class.forName(MGEN, false, cl);
             genCtor = genClass.getConstructor(int.class, ItemStack[].class, ItemStack[].class);
             fRecipeList = rs.getField("MACHINE_RECIPELIST");
             fMachineList = rs.getField("STACKMACHINE_LIST");
@@ -120,8 +180,8 @@ public final class LogiTechStackBridge {
             mTransfer = rs.getMethod("transferRSCRecipes", MachineRecipe.class);
             mTryGen = mru.getMethod("tryGenerateMGFromMachine", MachineRecipe.class);
             mStackFrom = mru.getMethod("stackFromMachine", MachineRecipe.class);
-            // 重入期（对方的静态初始化还没跑完）字段可能还是 null：这次判「未就绪」，
-            // 让调用方拿空表且不缓存，等 registerAll 的时机再探一次
+            // 静态字段在静态块之前初始化（RecipeSupporter.java:604-608 早于 :1889），
+            // 扫描期读它一定是就绪的；真为 null 说明对方版本结构不同，本次不给结论
             if (fRecipeList.get(null) == null || fMachineList.get(null) == null || fGeneratorList.get(null) == null) {
                 available = false;
                 return false;
@@ -130,7 +190,7 @@ public final class LogiTechStackBridge {
             return true;
         } catch (Throwable t) {
             available = false;
-            TT.log("[兼容] 未检测到可对接的逻辑工艺（LogiTech），堆叠机对接跳过: " + t.getClass().getSimpleName());
+            TT.log("[兼容] 逻辑工艺对接层探测失败，堆叠机对接跳过: " + t);
             return true;
         }
     }
@@ -145,7 +205,9 @@ public final class LogiTechStackBridge {
      * </ol>
      */
     public static List<MachineRecipe> buildRecipes(List<TTRecipe> source) {
-        if (!available() || source == null || source.isEmpty()) return Collections.emptyList();
+        // ready() = 「对方已完成/已进入配方供应器扫描」且探测成功。
+        // 在这之前一律返回空表：绝不能因为一次提前的调用就把对方的类初始化掉。
+        if (!ready() || source == null || source.isEmpty()) return Collections.emptyList();
         boolean allPureGenerator = true;
         for (TTRecipe r : source) {
             if (!isPureGenerator(r)) {
@@ -220,12 +282,50 @@ public final class LogiTechStackBridge {
     }
 
     /**
+     * 计划一次登记：等逻辑工艺自己完成「配方供应器」扫描之后，再补耗电修正与兜底补登。
+     *
+     * <p><b>为什么不能立刻登记</b>：对方的扫描是在它自己的静态块里完成的
+     * （{@code RecipeSupporter.java:1889-1892}），触发点是第 1 tick 的
+     * {@code PostSetupTasks.schedulePostRegister()}（{@code Schedules.java:36-41}）。
+     * 只要我们在 {@code onEnable} 里提前 {@code Class.forName} 一次，这份「等全体附属注册完
+     * 再快照」的时序就被打乱，晚于本插件 enable 的附属机器会整批缺席——而且是静默的。</p>
+     *
+     * <p>所以：① 只轮询对方无害的 {@code PostSetupTasks.startPostRegister} 标志
+     * （不碰 {@code RecipeSupporter}）；② 该标志出现即说明扫描已开始/完成；③ 兜底最多等
+     * {@value #POST_REGISTER_MAX_WAIT} tick，超时按时间继续（应对对方字段名随版本变化）。</p>
+     */
+    public static void scheduleRegister(org.bukkit.plugin.Plugin plugin) {
+        if (!classPresent()) return;   // 没装逻辑工艺：连定时器都不起
+        new org.bukkit.scheduler.BukkitRunnable() {
+            private int waited;
+
+            @Override
+            public void run() {
+                waited++;
+                boolean done = postRegisterDone();
+                if (!done && waited < POST_REGISTER_MAX_WAIT) return;
+                cancel();
+                if (!done) {
+                    TT.log("[兼容] 逻辑工艺的 post-register 标志在 " + waited + " tick 内未出现"
+                            + (postRegisterFlagMissing() ? "（字段名可能随版本变化）" : "")
+                            + "，按预设时机继续登记");
+                }
+                registerAll();
+            }
+        }.runTaskTimer(plugin, 2L, 1L);
+    }
+
+    /** 等对方 post-register 标志的最长 tick 数（1 秒）。 */
+    private static final int POST_REGISTER_MAX_WAIT = 20;
+
+    /**
      * 把已注册的糖然科技机器登记进逻辑工艺的堆叠表，并修正单机耗电。
      *
-     * <p>必须在 {@code Setup.loadAll()} 之后调用（机器已注册、配方已就绪）。</p>
+     * <p>只应由 {@link #scheduleRegister} 在对方扫描结束后调用。<b>不要</b>在
+     * {@code onEnable} 里直接调——那会把对方的静态扫描提前到「其他附属还没注册」的时点。</p>
      */
     public static void registerAll() {
-        if (!available()) return;
+        if (!ready()) return;
         try {
             Map<SlimefunItem, List<MachineRecipe>> recipeList = map(fRecipeList);
             Map<SlimefunItem, Integer> machineList = map(fMachineList);
@@ -235,6 +335,7 @@ public final class LogiTechStackBridge {
             int mach = 0;
             int skipped = 0;
             int excluded = 0;
+            int adopted = 0;
             for (SlimefunItem item : new ArrayList<>(Slimefun.getRegistry().getEnabledSlimefunItems())) {
                 // 脚本机器（命轨织机等）的产能由 NativeScript 的 tick 钩子驱动，没有「输入槽 + 配方」
                 // 这层语义，堆叠机无从复制：显式排除，防止将来它被改成继承 TTRecipeMachine 后误入堆叠表
@@ -252,7 +353,10 @@ public final class LogiTechStackBridge {
                 }
                 boolean isGenerator = isAllGenerator(recipes);
                 int energy = perTickEnergy(machine);
-                recipeList.put(item, recipes);
+                // 扫描期对方的表里已经有我们（它调过 getMachineRecipes()）：那条是它自己转换后的
+                // 形态，保留不要覆盖；只有缺席时才补登
+                if (recipeList.containsKey(item)) adopted++;
+                else recipeList.put(item, recipes);
                 Map<SlimefunItem, Integer> target = isGenerator ? generatorList : machineList;
                 Map<SlimefunItem, Integer> other = isGenerator ? machineList : generatorList;
                 if (target.containsKey(item)) {
@@ -270,6 +374,7 @@ public final class LogiTechStackBridge {
                 syncCachedList(item, energy, isGenerator);
             }
             TT.log("[兼容] 逻辑工艺堆叠对接完成：生成机器 " + gen + " 台 / 配方机器 " + mach + " 台"
+                    + (adopted > 0 ? "（其中 " + adopted + " 台由对方扫描自动收编）" : "")
                     + (skipped > 0 ? "（" + skipped + " 台无可用配方已跳过）" : "")
                     + (excluded > 0 ? "（" + excluded + " 台多方块核心不参与堆叠）" : ""));
         } catch (Throwable t) {

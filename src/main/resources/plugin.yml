@@ -1,5 +1,5 @@
 name: TangranTech
-version: 2.1.2-standalone
+version: 2.1.3-standalone
 main: com.tangran.tangrantech.TangranTechPlugin
 api-version: '1.21'
 author: Tang_ran
@@ -7,7 +7,8 @@ description: 糖然科技 —— 独立 Slimefun 附属（由 RSC 脚本版重�
 depend: [Slimefun]
 # LuckPerms：权限层走它的 API（管理节点 tangrantech.admin.* 与玩法资格节点），
 # 缺失时自动回落 Bukkit 原生 hasPermission / isOp（功能不受影响）。
-# LogiTech：堆叠机对接（compat/LogiTechStackBridge）需要它先完成机器分类，再写入我们的机器；
+# LogiTech：堆叠机对接（compat/LogiTechStackBridge）只在它自己的「配方供应器」扫描结束后
+# 登记一次（见该类的 scheduleRegister）；列进 softdepend 保证它先 enable、先排期那次扫描。
 # 缺失时该对接整体跳过，本插件功能不受影响。
 # 列进 softdepend 保证它们先启动（权限探测是「失败一次就记住不可用」）。
 softdepend: [LuckPerms, LogiTech]

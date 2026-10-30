@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.tangran"
-version = "2.1.2-standalone"
+version = "2.1.3-standalone"
 
 java {
     toolchain.languageVersion.set(JavaLanguageVersion.of(21))

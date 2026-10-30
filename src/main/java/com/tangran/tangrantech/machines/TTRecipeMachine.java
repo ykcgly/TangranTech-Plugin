@@ -210,14 +210,22 @@ public class TTRecipeMachine extends AContainer implements RecipeDisplayItem, Po
      * 因此覆写不影响自身产能与界面。</p>
      *
      * <p>两条排除规则：① {@link #supportsLogiTechStacking()} 为 {@code false} 的机器
-     * （多方块核心）直接给空表；② 桥接层尚未就绪（未装 LogiTech，或正处在对方静态初始化
-     * 的重入期）时返回空表且<b>不写缓存</b>，避免把「暂时不可用」固化成一辈子的空配方。</p>
+     * （多方块核心）直接给空表；② 桥接层尚未就绪（未装 LogiTech，或逻辑工艺还没到它自己的
+     * post-register 阶段）时返回空表且<b>不写缓存</b>——这里必须「一票否决」，
+     * 因为对方是靠「第 1 tick 才首次读取配方」来保证快照到全部附属的机器，
+     * 我们提前触发它的类初始化会让晚加载附属的配方整批消失（详见
+     * {@link com.tangran.tangrantech.compat.LogiTechStackBridge} 的第 5 条纪律）。</p>
      */
     @Override
     public List<me.mrCookieSlime.Slimefun.Objects.SlimefunItem.abstractItems.MachineRecipe> getMachineRecipes() {
         if (!supportsLogiTechStacking()) return java.util.Collections.emptyList();
         var cached = logiTechRecipes;
         if (cached != null) return cached;
+        // 没装逻辑工艺：探测一次就永久给空表，别让指南每次渲染都跑一遍反射
+        if (!com.tangran.tangrantech.compat.LogiTechStackBridge.classPresent()) {
+            logiTechRecipes = java.util.Collections.emptyList();
+            return logiTechRecipes;
+        }
         List<me.mrCookieSlime.Slimefun.Objects.SlimefunItem.abstractItems.MachineRecipe> built =
                 com.tangran.tangrantech.compat.LogiTechStackBridge.buildRecipes(recipes);
         if (!com.tangran.tangrantech.compat.LogiTechStackBridge.ready()) return built;
