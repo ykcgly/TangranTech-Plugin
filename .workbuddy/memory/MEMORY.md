@@ -4,7 +4,7 @@
 糖然科技 TangranTech：RSC（RykenSlimefunCustomizer）附属 → 独立 Slimefun4 jar 插件。
 包名 `com.tangran.tangrantech`，主类 `TangranTechPlugin`，上下文 `TT`。
 目标 Paper 1.21.x + Slimefun4 Beta（`libs/Slimefun4-347d926-Beta.jar`，compileOnly）。
-产物 `TangranTech-2.1.2-standalone.jar`（约 7.1 MB，含 xerial sqlite-jdbc 驱动与常用平台原生库）。构建：`./gradlew build`（JDK 21，见 gradle.properties 的 org.gradle.java.home，默认 JDK 25 会崩在配置阶段）。
+产物 `TangranTech-2.1.3-standalone.jar`（约 7.1 MB，含 xerial sqlite-jdbc 驱动与常用平台原生库）。构建：`./gradlew build`（JDK 21，见 gradle.properties 的 org.gradle.java.home，默认 JDK 25 会崩在配置阶段）。
 **发版流程**：改 `build.gradle.kts` 的 `version` + `src/main/resources/plugin.yml` 的 `version` + README 产物路径 → 构建 → 提交 → `git tag -a vX.Y.Z` → 推 main 与 tag → GitHub Release（本机无 gh CLI，走 REST API：`git credential fill` 取已缓存 token 后 curl POST `/releases`，再 POST `uploads.github.com/.../assets` 传 jar）。
 
 ## 架构要点（改代码前必读）
@@ -72,8 +72,17 @@
 必须让 `getMachineRecipes()` 本身返回空（`TTRecipeMachine.supportsLogiTechStacking()`，
 多方块核心 `TTSuperMultiBlockMachine` 返回 false；脚本机 `ScriptMachineItem` 继承 `SlimefunItem`
 天然不在范围）。三条纪律：只追加不重排（删条目会让 `craftType` 下标串机）、耗电
-`ceil(energy/minTicks)`、探测重入（对方静态 init 会回调我们）用 `resolving` 标记 + `ready()`，
-未就绪结果不缓存。已知限制：0 输入配方在堆叠机侧因 `matchMultiRecipe` 空输入返回 null 需占位物。
+`ceil(energy/minTicks)`、`registerAll` 里已存在的条目只改耗电不覆盖配方（对方存的是它自己转换后的形态）。
+已知限制：0 输入配方在堆叠机侧因 `matchMultiRecipe` 空输入返回 null 需占位物。
+
+⑬ **跨插件反射对接的第一铁律：`Class.forName` 必须带 `initialize=false`**（v2.1.2 回归案）。
+LogiTech 把全部重活放在 `RecipeSupporter` 的静态块里，靠「第 1 tick 才首次 touch」实现
+「等全体附属注册完再快照」（`Schedules:36-41` 第 1 tick → `PostSetupTasks.schedulePostRegister()`
+先置 `startPostRegister` 再调空的 `init()`）；v2.1.2 在 `onEnable` 里 `Class.forName(RS)`
+（默认初始化）把扫描提前到第 0 tick → 晚于本插件 enable 的附属配方**整批静默缺席且永不可补**。
+现在的做法：`scheduleRegister` 轮询对方 `PostSetupTasks.startPostRegister`（该 clinit 只有一个
+HashSet，不牵连 RecipeSupporter），等到才登记；`resolve()` 首行 `if (!postRegisterDone()) return false`。
+判断对方是否「已就绪碰表」，只找它自己的**无害标志字段**，绝不读目标类的成员来试探。
 
 ## 部署与协作约定
 - jar 由用户手动拷到测试服，AI 不写测试服目录。
