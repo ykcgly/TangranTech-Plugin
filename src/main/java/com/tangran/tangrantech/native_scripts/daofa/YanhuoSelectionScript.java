@@ -1007,43 +1007,67 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
                 YanhuoSelectionScript::watchdogTick, 1L, 1L);
     }
 
-    /** 每刻比对血量，回滚「没有对应伤害事件」的掉血。 */
+    /**
+     * 每刻比对血量，回滚「没有对应伤害事件」的掉血。
+     *
+     * <p><b>结构铁律：这条每刻循环里，只有厚土（EARTH）玩家才允许做实际工作。</b>
+     * 非厚土玩家在选中状态判定后立即 {@code continue}——不查挑战锁、不碰血量基准、
+     * 不写任何 map（原实现对全员每刻做 {@code isDead + 2 次 CHM put + isPhaseTwoLocked}）。</p>
+     *
+     * <p>由此产生的不变量：{@link #WD_LAST_HP} 里只会有厚土玩家，
+     * {@code onDamageMonitor} 据此用一次 {@code containsKey} 就能过滤掉非厚土的受伤事件。</p>
+     */
     private static void watchdogTick() {
         try {
             long now = System.currentTimeMillis();
             for (Player p : Bukkit.getOnlinePlayers()) {
                 try {
                     UUID uuid = p.getUniqueId();
+
+                    // ---------- 选中状态：全部内存级，零 IO ----------
+                    String sel = WD_SELECTED.get(uuid);
+                    if (EARTH_ID.equals(sel)) {
+                        // 只有厚土玩家才需要确认「是否处于二阶段挑战」——挑战锁定的语义只是
+                        // 「视为未选中」，对非厚土玩家毫无影响。锁定时不读也不污染缓存，
+                        // 只把时间戳顶新：解锁后下一刻立即过期重读存档（不存在恢复延迟窗口）。
+                        boolean phase2 = false;
+                        try {
+                            phase2 = BossChallengeState.isPhaseTwoLocked(p);
+                        } catch (Throwable ignored) {
+                            // 探测失败按未锁定处理（与 selectedYanhuo 内的容错一致）
+                        }
+                        if (phase2) {
+                            WD_SELECTED_AT.put(uuid, now);
+                            // 挑战期间不护不回滚，但必须继续维护血量基准 —— 否则解锁后
+                            // 基准还停在挑战前，玩家在挑战里掉的血会被当成「无事件掉血」错误回滚
+                            WD_LAST_HP.put(uuid, p.isDead() ? 0.0 : p.getHealth());
+                            WD_ALLOWED.put(uuid, 0.0);
+                            continue;   // 本刻按未选中处理：厚土免死等被动全部失效
+                        }
+                    } else if (sel == null
+                            || (now - WD_SELECTED_AT.getOrDefault(uuid, 0L)) > SELECTED_TTL_MS) {
+                        // selectedYanhuo 内含「二阶段挑战期间视为未选中」，所以挑战中不会误护
+                        String fresh = selectedYanhuo(p.getName());
+                        // 负结果也进缓存（哨兵值）：remove() 会让下一刻的 null 判断再次成立
+                        sel = (fresh == null) ? NONE_SELECTED : fresh;
+                        WD_SELECTED.put(uuid, sel);
+                        WD_SELECTED_AT.put(uuid, now);
+                    }
+
+                    // ---------- 非厚土：清掉基准，什么都不做 ----------
+                    // 原实现对所有玩家每刻做 isDead + 2 次 CHM put + 全员查挑战锁，
+                    // spark 实测这些无用功占主线程 0.5%+，而在线玩家里厚土通常一个都没有。
+                    if (!EARTH_ID.equals(sel)) {
+                        if (WD_LAST_HP.remove(uuid) != null) {
+                            WD_ALLOWED.remove(uuid);
+                        }
+                        continue;
+                    }
+
                     if (p.isDead()) {
                         WD_LAST_HP.put(uuid, 0.0);
                         WD_ALLOWED.put(uuid, 0.0);
                         continue;
-                    }
-
-                    // 二阶段挑战期间一律视为未选中（含厚土免死在内全部被动失效）。
-                    // isPhaseTwoLocked 是纯内存查询（metadata + map），每刻调它零成本：
-                    // 锁定时不读缓存、也不污染缓存，只把时间戳顶新 —— 解锁后下一刻立即过期重读，
-                    // 不会出现「挑战已结束 30 秒异火还没恢复」的窗口。
-                    boolean phase2 = false;
-                    try {
-                        phase2 = BossChallengeState.isPhaseTwoLocked(p);
-                    } catch (Throwable ignored) {
-                        // 探测失败按未锁定处理（与 selectedYanhuo 内的容错一致）
-                    }
-                    String sel;
-                    if (phase2) {
-                        WD_SELECTED_AT.put(uuid, now);
-                        sel = NONE_SELECTED;
-                    } else {
-                        sel = WD_SELECTED.get(uuid);
-                        if (sel == null || (now - WD_SELECTED_AT.getOrDefault(uuid, 0L)) > SELECTED_TTL_MS) {
-                            // selectedYanhuo 内含「二阶段挑战期间视为未选中」，所以挑战中不会误护
-                            String fresh = selectedYanhuo(p.getName());
-                            // 负结果也进缓存（哨兵值）：remove() 会让下一刻的 null 判断再次成立
-                            sel = (fresh == null) ? NONE_SELECTED : fresh;
-                            WD_SELECTED.put(uuid, sel);
-                            WD_SELECTED_AT.put(uuid, now);
-                        }
                     }
 
                     double hp = p.getHealth();
@@ -1052,7 +1076,7 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
                     WD_LAST_HP.put(uuid, hp);
                     WD_ALLOWED.put(uuid, 0.0);   // 允许额度只在本刻生效
 
-                    if (!EARTH_ID.equals(sel) || lastBoxed == null) continue;
+                    if (lastBoxed == null) continue;
                     double last = lastBoxed;
                     if (hp >= last - 0.001) continue;   // 没掉血
                     double lost = last - hp;
@@ -1372,6 +1396,9 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
             try {
                 if (!(event.getEntity() instanceof Player player)) return;
                 UUID uuid = player.getUniqueId();
+                // 看门狗只消费厚土玩家的额度（watchdogTick 的不变量：WD_LAST_HP 只含厚土玩家）。
+                // 非厚土玩家的每次受伤原本都白做一次 merge + put，还会误把额度留给之后切厚土的时刻
+                if (!WD_LAST_HP.containsKey(uuid)) return;
                 double dmg;
                 try {
                     dmg = event.getFinalDamage();

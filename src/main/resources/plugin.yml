@@ -1,5 +1,5 @@
 name: TangranTech
-version: 2.1.4-standalone
+version: 2.1.5-standalone
 main: com.tangran.tangrantech.TangranTechPlugin
 api-version: '1.21'
 author: Tang_ran
