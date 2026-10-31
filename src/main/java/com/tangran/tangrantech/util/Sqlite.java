@@ -97,14 +97,39 @@ public final class Sqlite {
         }, -1);
     }
 
+    /**
+     * 按 SQL 文本复用的预编译语句表。
+     *
+     * <p>只在 {@link #within} 的全局锁内访问，天然串行，普通 {@code HashMap} 即可。
+     * 原实现每次 {@code prepareStatement} 都让 SQLite 重新校验 schema，
+     * 单次实测毫秒级（spark: prepare_utf8 1.45ms/次）—— 复用后降到微秒级。
+     * 语句总数有限（各查询一个），不会膨胀。</p>
+     */
+    private static final java.util.HashMap<String, PreparedStatement> STMTS = new java.util.HashMap<>();
+
     /** 加锁执行一条查询，{@code reader} 消费结果集（失败返回 {@code fallback}）。 */
     public static <T> T select(String sql, RowReader<T> reader, T fallback, Object... args) {
         return within(c -> {
-            try (PreparedStatement ps = c.prepareStatement(sql)) {
+            PreparedStatement ps = STMTS.get(sql);
+            if (ps == null) {
+                ps = c.prepareStatement(sql);
+                STMTS.put(sql, ps);
+            }
+            try {
+                ps.clearParameters();
                 bind(ps, args);
                 try (ResultSet rs = ps.executeQuery()) {
                     return reader.read(rs);
                 }
+            } catch (SQLException e) {
+                // 语句可能已处于坏状态（schema 变更 / 句柄失效）：踢出缓存下次重建
+                STMTS.remove(sql);
+                try {
+                    ps.close();
+                } catch (Throwable ignored) {
+                    // 尽力而为
+                }
+                throw e;
             }
         }, fallback);
     }
@@ -119,6 +144,14 @@ public final class Sqlite {
     /** 关闭连接（插件卸载时调用）。 */
     public static void close() {
         synchronized (LOCK) {
+            for (PreparedStatement ps : STMTS.values()) {
+                try {
+                    ps.close();
+                } catch (Throwable ignored) {
+                    // 卸载阶段失败无所谓
+                }
+            }
+            STMTS.clear();
             try {
                 if (conn != null) conn.close();
             } catch (Throwable ignored) {

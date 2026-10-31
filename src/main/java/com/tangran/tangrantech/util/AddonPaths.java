@@ -65,6 +65,21 @@ public final class AddonPaths {
         return root == null ? null : new File(root, CONFIG_ROOT);
     }
 
+    /** 规范化后的玩家数据根目录 {@code Path}（缓存：{@code dataFolder} 启动后不变；
+     *  {@link #docParts} 是所有玩家数据读取的入口，原实现每读一份文档都做两次
+     *  {@code toPath().normalize()}）。 */
+    private static volatile java.nio.file.Path configRootPath;
+
+    private static java.nio.file.Path configRootPath() {
+        java.nio.file.Path p = configRootPath;
+        if (p == null) {
+            File root = configRoot();
+            p = root == null ? null : root.toPath().normalize();
+            configRootPath = p;
+        }
+        return p;
+    }
+
     /** 取（并创建）玩家数据侧的子目录。 */
     public static File configDir(String sub) {
         return ensure(new File(dataFolder(), CONFIG_ROOT + "/" + sub));
@@ -228,10 +243,10 @@ public final class AddonPaths {
         try {
             String name = file.getName();
             if (!name.toLowerCase(java.util.Locale.ROOT).endsWith(".json")) return null;
-            File root = configRoot();
+            java.nio.file.Path rootPath = configRootPath();
             File parent = file.getParentFile();
-            if (root == null || parent == null || parent.getParentFile() == null) return null;
-            if (!parent.getParentFile().toPath().normalize().equals(root.toPath().normalize())) {
+            if (rootPath == null || parent == null || parent.getParentFile() == null) return null;
+            if (!parent.getParentFile().toPath().normalize().equals(rootPath)) {
                 return null;
             }
             String key = name.substring(0, name.length() - 5);

@@ -65,7 +65,8 @@ public final class PlayerKeys {
      */
     public static String key(String nameOrUuid) {
         if (nameOrUuid == null || nameOrUuid.isBlank()) return nameOrUuid;
-        if (UUID_SHAPE.matcher(nameOrUuid).matches()) {
+        // 长度快判：UUID 恒 36 字符，玩家名不可能 —— 高频路径上让正则彻底短路
+        if (nameOrUuid.length() == 36 && UUID_SHAPE.matcher(nameOrUuid).matches()) {
             return nameOrUuid.toLowerCase(Locale.ROOT);
         }
         String lower = nameOrUuid.toLowerCase(Locale.ROOT);

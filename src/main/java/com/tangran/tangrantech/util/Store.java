@@ -53,7 +53,7 @@ public final class Store {
     private static boolean schemaReady;
 
     // ==================================================================
-    // 写后缓存：save() 先进内存，每 5 分钟由定时任务统一落库
+    // 写后缓存 + 读缓存：save() 先进内存，每 5 分钟统一落库；读永远先走内存
     // ==================================================================
 
     /**
@@ -69,6 +69,31 @@ public final class Store {
      * —— 命名空间与键都是玩家数据里的目录名 / 文件名，不可能含 NUL。</p>
      */
     private static final ConcurrentHashMap<String, String> PENDING = new ConcurrentHashMap<>();
+
+    /**
+     * 读缓存：组合键 → 库里的原始 JSON 文本；{@link #ABSENT} 表示「确认库里没有」的负缓存。
+     *
+     * <p>写入路径（{@link #save}/{@link #delete}）与落库（{@link #flush}）都会同步维护它，
+     * 所以本进程内它永远是库内容的超集视图。<b>缓存字符串而不是解析后的 Map</b>：
+     * {@code load()} 每次返回新解析的副本，调用方（如异火的 {@code setSelected}）
+     * 就地修改返回值不会污染缓存 —— 这是有意为之的防脏设计。
+     * 解析一份几 KB 的 JSON 约 5µs，远低于一次 {@code prepareStatement}（毫秒级）。</p>
+     *
+     * <p>规模：每文档几 KB × 玩家数 × 命名空间数，测试服全库才 40KB，不设上限；
+     * {@link #shutdown()} 时清空。前提是本插件<b>独占</b> {@code tangran.db}
+     * —— 若有外部工具直接写库，读到的会是旧值（目前没有这样的工具；/tr import 也走本类）。</p>
+     */
+    private static final ConcurrentHashMap<String, String> DOC_CACHE = new ConcurrentHashMap<>();
+
+    /** 「库里确认没有这份文档」的负缓存标记（哨兵值，不会与合法 JSON 冲突）。 */
+    private static final String ABSENT = "\u0000ABSENT";
+
+    /** {@link #load}/{@link #exists} 回库探测的内部哨兵：「正常查询但无此行」。 */
+    private static final String ROW_MISSING = "\u0000MISSING";
+
+    /** 回库探测的内部哨兵：查询本身异常（fallback）。此时<b>不写缓存</b>，免得把瞬时故障固化成「没有」。 */
+    private static final String QUERY_ERROR = "\u0000ERROR";
+
 
     /** 落库周期：5 分钟 = 6000 刻。 */
     private static final long FLUSH_PERIOD_TICKS = 6000L;
@@ -211,6 +236,7 @@ public final class Store {
         } catch (Throwable ignored) {
             // 关闭阶段尽力而为
         }
+        DOC_CACHE.clear();
         schemaReady = false;
         Sqlite.close();
     }
@@ -251,18 +277,30 @@ public final class Store {
     @SuppressWarnings("unchecked")
     public static Map<String, Object> load(String ns, String key) {
         if (!available() || ns == null || key == null) return null;
-        // 先查写后缓存：save() 之后、flush() 之前，读取必须看到最新值
-        String pending = PENDING.get(pendingKey(ns, key));
-        if (pending != null) {
-            try {
-                Object parsed = Json.parse(pending);
-                if (parsed instanceof Map<?, ?> m) return (Map<String, Object>) m;
-            } catch (Throwable ignored) {
-                // 缓存坏了就回落查库
+        String pk = pendingKey(ns, key);
+        // ① 先查写后缓存：save() 之后、flush() 之前，读取必须看到最新值
+        String text = PENDING.get(pk);
+        // ② 再查读缓存（含负缓存）：命中就完全不碰 SQLite
+        if (text == null) {
+            String cached = DOC_CACHE.get(pk);
+            if (cached != null) {
+                text = ABSENT.equals(cached) ? null : cached;
+            } else {
+                // ③ 都没有才回库。三种结果要区分开：
+                //    正常无行 → 负缓存 ABSENT；查到 → 缓存文本；
+                //    查询异常（fallback）→ 什么都不缓存，否则一次瞬时故障会把「有档」永久固化成「没档」
+                String fromDb = Sqlite.select("SELECT doc FROM " + TABLE + " WHERE ns=? AND key=?",
+                        rs -> rs.next() ? rs.getString(1) : ROW_MISSING, QUERY_ERROR, ns, key);
+                if (QUERY_ERROR.equals(fromDb)) return null;
+                DOC_CACHE.put(pk, fromDb == null || fromDb.isBlank() || ROW_MISSING.equals(fromDb)
+                        ? ABSENT : fromDb);
+                if (ROW_MISSING.equals(fromDb)) {
+                    text = null;
+                } else {
+                    text = fromDb;
+                }
             }
         }
-        String text = Sqlite.select("SELECT doc FROM " + TABLE + " WHERE ns=? AND key=?",
-                rs -> rs.next() ? rs.getString(1) : null, null, ns, key);
         if (text == null || text.isBlank()) return null;
         try {
             Object parsed = Json.parse(text);
@@ -294,22 +332,34 @@ public final class Store {
             return false;
         }
         PENDING.put(pendingKey(ns, key), text);
+        DOC_CACHE.put(pendingKey(ns, key), text);   // 读缓存同步最新值，flush 落库后依然命中
         return true;
     }
 
-    /** 删一份文档（缓存里的待写版本一并作废）。 */
+    /** 删一份文档（缓存里的待写版本一并作废，读缓存记为「确认没有」）。 */
     public static boolean delete(String ns, String key) {
         if (!available() || ns == null || key == null) return false;
-        PENDING.remove(pendingKey(ns, key));
+        String pk = pendingKey(ns, key);
+        PENDING.remove(pk);
+        DOC_CACHE.put(pk, ABSENT);
         return Sqlite.exec("DELETE FROM " + TABLE + " WHERE ns=? AND key=?", ns, key) >= 0;
     }
 
     /** 文档是否存在（含缓存中尚未落库的）。 */
     public static boolean exists(String ns, String key) {
         if (!available() || ns == null || key == null) return false;
-        if (PENDING.containsKey(pendingKey(ns, key))) return true;
+        String pk = pendingKey(ns, key);
+        if (PENDING.containsKey(pk)) return true;
+        String cached = DOC_CACHE.get(pk);
+        if (cached != null) return !ABSENT.equals(cached);
         Integer one = Sqlite.select("SELECT 1 FROM " + TABLE + " WHERE ns=? AND key=? LIMIT 1",
-                rs -> rs.next() ? 1 : 0, 0, ns, key);
+                rs -> rs.next() ? 1 : 0, -1, ns, key);
+        // 异常（fallback -1）不写缓存；只有「确认不存在」才写 —— DOC_CACHE 的正向值必须是
+        // load/save 放进去的完整文本，塞个空串会让 load 把它当空白文档返回 null
+        if (one == null || one != 1) {
+            if (one == null || one < 0) return false;   // 查询异常：不缓存
+            DOC_CACHE.put(pk, ABSENT);
+        }
         return one != null && one == 1;
     }
 

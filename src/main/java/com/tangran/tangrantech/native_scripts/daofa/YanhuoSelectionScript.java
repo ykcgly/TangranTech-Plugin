@@ -222,6 +222,27 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
     private static final Map<UUID, Double> WD_LAST_HP = new ConcurrentHashMap<>();
     private static final Map<UUID, String> WD_SELECTED = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> WD_SELECTED_AT = new ConcurrentHashMap<>();
+
+    /**
+     * 「已确认没有选中异火」的哨兵值。
+     *
+     * <p>{@link ConcurrentHashMap} 不允许 null —— 早期用 {@code remove()} 表示「没有」，
+     * 会让下一刻的 {@code sel == null} 再次成立，负结果永远缓存不住：没选异火的玩家
+     * 每刻都完整走一遍 SQLite + 两次 {@code File.exists}（spark 实测单人 8.2ms/刻、
+     * 占主线程 16.4%）。负结果也进缓存后，这一整类调用归零。
+     * {@code EARTH_ID.equals(NONE_SELECTED)} 恒为 false，非厚土玩家照旧跳过护血。</p>
+     */
+    private static final String NONE_SELECTED = "\u0000NONE";
+
+    /**
+     * watchdog 选中状态的兜底 TTL。
+     *
+     * <p>正常情况下选中状态只在 {@link #setSelected}（玩家自选 / 挑战清空）里变化，
+     * 那里会调 {@link #invalidateSelected} 事件式失效；这个长 TTL 只是防漏的保险，
+     * 把「没选异火」玩家的重复查询从每刻一次压到 30 秒一次。</p>
+     */
+    private static final long SELECTED_TTL_MS = 30_000L;
+
     private static final Map<UUID, Long> WD_MSG_AT = new ConcurrentHashMap<>();
 
     private static volatile BukkitTask watchdogTask;
@@ -312,8 +333,23 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
     // 存档
     // ------------------------------------------------------------------
 
+    /** 异火存档目录（缓存 {@code File} 对象：原实现每刻都 {@code configDir → ensure → exists()}，
+     *  白白多一次 stat 系统调用；目录在启动时已建好，运行期不会变）。 */
+    private static volatile File YANHUO_DIR;
+
+    private static File yanhuoDir() {
+        File d = YANHUO_DIR;
+        if (d == null) {
+            synchronized (YanhuoSelectionScript.class) {
+                d = YANHUO_DIR;
+                if (d == null) YANHUO_DIR = d = AddonPaths.configDir(AddonPaths.DIR_YANHUO);
+            }
+        }
+        return d;
+    }
+
     private static File yanhuoFile(String playerName) {
-        return new File(AddonPaths.configDir(AddonPaths.DIR_YANHUO), PlayerKeys.key(playerName) + ".json");
+        return new File(yanhuoDir(), PlayerKeys.key(playerName) + ".json");
     }
 
     /** 玩家已拥有的异火 id 列表。 */
@@ -354,6 +390,26 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
         if (!(data.get("owned") instanceof List)) data.put("owned", new ArrayList<>());
         data.put("selected", id);
         AddonPaths.writeJson(yanhuoFile(playerName), data);
+        invalidateSelected(playerName);
+    }
+
+    /**
+     * 事件式失效 watchdog 的选中缓存（选中状态只在 {@link #setSelected} 里变化，
+     * 玩家自选与挑战清空都会走到这里）——这比轮询便宜得多，也让长 TTL 只当保险用。
+     */
+    private static void invalidateSelected(String playerName) {
+        if (playerName == null) return;
+        try {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                if (p.getName().equalsIgnoreCase(playerName)) {
+                    WD_SELECTED.remove(p.getUniqueId());
+                    WD_SELECTED_AT.remove(p.getUniqueId());
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 失效失败只是让缓存多留一会儿，由 TTL 兜底
+        }
     }
 
     /** 供 BOSS战 在挑战期间调用：删掉当前异火选择并收掉异火带来的被动。 */
@@ -964,13 +1020,30 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
                         continue;
                     }
 
-                    String sel = WD_SELECTED.get(uuid);
-                    if (sel == null || (now - WD_SELECTED_AT.getOrDefault(uuid, 0L)) > 1000) {
-                        // selectedYanhuo 内含「二阶段挑战期间视为未选中」，所以挑战中不会误护
-                        sel = selectedYanhuo(p.getName());
-                        if (sel != null) WD_SELECTED.put(uuid, sel);
-                        else WD_SELECTED.remove(uuid);
+                    // 二阶段挑战期间一律视为未选中（含厚土免死在内全部被动失效）。
+                    // isPhaseTwoLocked 是纯内存查询（metadata + map），每刻调它零成本：
+                    // 锁定时不读缓存、也不污染缓存，只把时间戳顶新 —— 解锁后下一刻立即过期重读，
+                    // 不会出现「挑战已结束 30 秒异火还没恢复」的窗口。
+                    boolean phase2 = false;
+                    try {
+                        phase2 = BossChallengeState.isPhaseTwoLocked(p);
+                    } catch (Throwable ignored) {
+                        // 探测失败按未锁定处理（与 selectedYanhuo 内的容错一致）
+                    }
+                    String sel;
+                    if (phase2) {
                         WD_SELECTED_AT.put(uuid, now);
+                        sel = NONE_SELECTED;
+                    } else {
+                        sel = WD_SELECTED.get(uuid);
+                        if (sel == null || (now - WD_SELECTED_AT.getOrDefault(uuid, 0L)) > SELECTED_TTL_MS) {
+                            // selectedYanhuo 内含「二阶段挑战期间视为未选中」，所以挑战中不会误护
+                            String fresh = selectedYanhuo(p.getName());
+                            // 负结果也进缓存（哨兵值）：remove() 会让下一刻的 null 判断再次成立
+                            sel = (fresh == null) ? NONE_SELECTED : fresh;
+                            WD_SELECTED.put(uuid, sel);
+                            WD_SELECTED_AT.put(uuid, now);
+                        }
                     }
 
                     double hp = p.getHealth();
