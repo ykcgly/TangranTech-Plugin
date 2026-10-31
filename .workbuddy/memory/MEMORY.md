@@ -4,7 +4,7 @@
 糖然科技 TangranTech：RSC（RykenSlimefunCustomizer）附属 → 独立 Slimefun4 jar 插件。
 包名 `com.tangran.tangrantech`，主类 `TangranTechPlugin`，上下文 `TT`。
 目标 Paper 1.21.x + Slimefun4 Beta（`libs/Slimefun4-347d926-Beta.jar`，compileOnly）。
-产物 `TangranTech-2.1.4-standalone.jar`（约 7.1 MB，含 xerial sqlite-jdbc 驱动与常用平台原生库）。构建：`./gradlew build`（JDK 21，见 gradle.properties 的 org.gradle.java.home，默认 JDK 25 会崩在配置阶段）。
+产物 `TangranTech-2.1.5-standalone.jar`（约 7.1 MB，含 xerial sqlite-jdbc 驱动与常用平台原生库）。构建：`./gradlew build`（JDK 21，见 gradle.properties 的 org.gradle.java.home，默认 JDK 25 会崩在配置阶段）。
 **发版流程**：改 `build.gradle.kts` 的 `version` + `src/main/resources/plugin.yml` 的 `version` + README 产物路径 → 构建 → 提交 → `git tag -a vX.Y.Z` → 推 main 与 tag → GitHub Release（本机无 gh CLI，走 REST API：`git credential fill` 取已缓存 token 后 curl POST `/releases`，再 POST `uploads.github.com/.../assets` 传 jar）。
 
 ## 架构要点（改代码前必读）
