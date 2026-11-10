@@ -9,6 +9,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 附属数据路径的统一入口。
@@ -80,6 +81,51 @@ public final class AddonPaths {
         return p;
     }
 
+    // ------------------------------------------------------------------
+    // 旧 JSON 回落探测的负缓存
+    // ------------------------------------------------------------------
+
+    /**
+     * 「库里没有、磁盘上也没有同名旧 JSON」的负缓存：组合键 {@code ns + '\0' + key}
+     * → 过期时刻（{@link System#nanoTime()}）。
+     *
+     * <p>{@link Store} 的读缓存挡住了 SQLite，却挡不住 {@link #readJson} 在
+     * {@code Store.load} 返回 null 后<b>无条件</b>做的 {@code readJsonFile → File.exists()}。
+     * 对「没有存档」的玩家，每次事件 / 周期读档都会落到一次 Windows native stat
+     * （spark 实测 {@code WinNTFileSystem.getBooleanAttributes0} 榜首链的末端）。
+     * 本缓存把这条路径压到 30 秒一次，且<b>只在库可用时</b>启用：库不可用时整体降级为
+     * 文件后端，绝不能缓存「文件不存在」。</p>
+     *
+     * <p>带 TTL 是为了让管理员手动补放旧档、或外部工具写入后能在半分钟内自动生效；
+     * 带容量上限是为了防止玩家上下线让过期条目长期堆积。</p>
+     */
+    private static final long LEGACY_ABSENT_TTL_NS = 30L * 1_000_000_000L;
+    private static final int LEGACY_ABSENT_MAX = 4096;
+    private static final ConcurrentHashMap<String, Long> LEGACY_FILE_ABSENT = new ConcurrentHashMap<>();
+
+    private static String legacyKey(String ns, String key) {
+        return ns + '\u0000' + key;
+    }
+
+    private static boolean legacyFileAbsent(String ns, String key) {
+        String pk = legacyKey(ns, key);
+        Long until = LEGACY_FILE_ABSENT.get(pk);
+        if (until == null) return false;
+        if (System.nanoTime() - until < 0) return true;
+        LEGACY_FILE_ABSENT.remove(pk, until);   // 过期就让它下次重新探测
+        return false;
+    }
+
+    private static void markLegacyFileAbsent(String ns, String key) {
+        if (LEGACY_FILE_ABSENT.size() >= LEGACY_ABSENT_MAX) LEGACY_FILE_ABSENT.clear();
+        LEGACY_FILE_ABSENT.put(legacyKey(ns, key), System.nanoTime() + LEGACY_ABSENT_TTL_NS);
+    }
+
+    /** 让所有「旧文件不存在」的结论立即失效（导入前后、停服、外部补档时调用）。 */
+    public static void clearLegacyFileAbsentCache() {
+        LEGACY_FILE_ABSENT.clear();
+    }
+
     /** 取（并创建）玩家数据侧的子目录。 */
     public static File configDir(String sub) {
         return ensure(new File(dataFolder(), CONFIG_ROOT + "/" + sub));
@@ -147,9 +193,16 @@ public final class AddonPaths {
         if (doc != null) {
             Map<String, Object> fromDb = Store.load(doc[0], doc[1]);
             if (fromDb != null) return fromDb;
+            // 库不可用时是「文件后端」，此时一次 exists() 都不能省 —— 负缓存只在库可用时启用
+            boolean cacheable = Store.available();
+            if (cacheable && legacyFileAbsent(doc[0], doc[1])) return null;
             Map<String, Object> fromFile = readJsonFile(file);
             if (fromFile != null) {
                 Store.save(doc[0], doc[1], fromFile);   // 惰性迁移：只补空缺，不覆盖
+            } else if (cacheable) {
+                // 「库里没有 + 磁盘上也没有」：30 秒内不再做 native stat。
+                // 文件存在但损坏 / 读失败也会落到这里，靠 TTL 与下面的显式失效兜底。
+                markLegacyFileAbsent(doc[0], doc[1]);
             }
             return fromFile;
         }
@@ -166,7 +219,9 @@ public final class AddonPaths {
         String[] doc = docParts(file);
         if (doc != null) {
             if (Store.save(doc[0], doc[1], data)) return true;
-            // 库不可用 → 继续走文件
+            // 库不可用 → 继续走真实文件写入。先撤掉「磁盘无此旧文件」的缓存，
+            // 否则紧接着的 readJson 会在 30 秒内读不到刚写下的文件
+            LEGACY_FILE_ABSENT.remove(legacyKey(doc[0], doc[1]));
         }
         return writeJsonFile(file, data);
     }
@@ -187,6 +242,8 @@ public final class AddonPaths {
         if (file == null) return false;
         String[] doc = docParts(file);
         if (doc != null) {
+            // 删档后让旧文件探测重新做一次结论，不保留任何可能陈旧的负缓存
+            LEGACY_FILE_ABSENT.remove(legacyKey(doc[0], doc[1]));
             boolean db = Store.delete(doc[0], doc[1]);
             boolean fs = file.isFile() && file.delete();
             return db || fs;

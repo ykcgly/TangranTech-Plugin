@@ -1,6 +1,7 @@
 package com.tangran.tangrantech.command;
 
 import com.tangran.tangrantech.TT;
+import com.tangran.tangrantech.util.AddonPaths;
 import com.tangran.tangrantech.util.Perms;
 import com.tangran.tangrantech.util.Store;
 import java.io.File;
@@ -169,6 +170,10 @@ public final class TrCommand implements CommandExecutor, TabCompleter {
                 + (doOverwrite ? " §7+ 覆盖已有" : ""));
         if (!onlyNs.isEmpty()) sender.sendMessage("§6[导入] §f只导：" + String.join(", ", onlyNs));
 
+        // 导入可能把旧 JSON 直接补进本插件的数据目录（--source 可以指向它），
+        // 先作废「磁盘无此文件」的负缓存，保证导入后立刻能读到
+        AddonPaths.clearLegacyFileAbsentCache();
+
         // 扫描要读成百上千个文件，放到异步线程；结果回主线程发消息
         Bukkit.getScheduler().runTaskAsynchronously(TT.plugin(), () -> {
             Store.ImportReport rep;
@@ -223,6 +228,8 @@ public final class TrCommand implements CommandExecutor, TabCompleter {
         }
         if (applied) {
             Store.flush();   // 立刻落库，别等 5 分钟周期 —— 导入是显式管理动作
+            // 异步导入期间其他线程可能又记下过「磁盘无此文件」，导入完成后再作废一次
+            AddonPaths.clearLegacyFileAbsentCache();
             sender.sendMessage("§a[导入] 已写入 SQLite。当前库内："
                     + describeNamespaces(Store.namespaces()));
         } else {

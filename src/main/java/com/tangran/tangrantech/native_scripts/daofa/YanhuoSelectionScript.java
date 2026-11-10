@@ -1335,16 +1335,24 @@ public final class YanhuoSelectionScript implements NativeLifecycleScript {
             }
         }
 
-        /** 兜底：拦截瞬间治疗（1.20.5 起 HEAL 更名为 INSTANT_HEALTH）。 */
+        /**
+         * 兜底：拦截瞬间治疗（1.20.5 起 HEAL 更名为 INSTANT_HEALTH）。
+         *
+         * <p><b>过滤必须排在 {@link #selectedYanhuo} 之前</b>：海龟头盔 / 潮涌核心 /
+         * 信标 / 无限时长药水（水火异火被动自己就会挂）每刻都会触发这个事件，
+         * 旧实现先读档再判类型，导致 99.9% 的高频刷新都白走一次
+         * {@code Store.load} + 旧文件回落 {@code File.exists}（spark 实测榜首 native 帧
+         * {@code WinNTFileSystem.getBooleanAttributes0} 的一条主链就来自这里）。
+         * 本监听器只对 INSTANT_HEALTH 有副作用，前移判断行为完全等价。</p>
+         */
         @EventHandler(priority = EventPriority.HIGHEST)
         public void onPotionEffect(EntityPotionEffectEvent event) {
             try {
                 if (!(event.getEntity() instanceof Player player)) return;
-                if (!EARTH_ID.equals(selectedYanhuo(player.getName()))) return;
                 PotionEffect eff = event.getNewEffect();
-                if (eff != null && eff.getType().equals(PotionEffectType.INSTANT_HEALTH)) {
-                    event.setCancelled(true);
-                }
+                if (eff == null || !eff.getType().equals(PotionEffectType.INSTANT_HEALTH)) return;
+                if (!EARTH_ID.equals(selectedYanhuo(player.getName()))) return;
+                event.setCancelled(true);
             } catch (Throwable ignored) {
                 // 忽略
             }

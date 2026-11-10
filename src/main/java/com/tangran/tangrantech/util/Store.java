@@ -237,6 +237,8 @@ public final class Store {
             // 关闭阶段尽力而为
         }
         DOC_CACHE.clear();
+        // 库关闭后 AddonPaths 会降级为文件后端，旧的「磁盘无此文件」结论必须全部作废
+        AddonPaths.clearLegacyFileAbsentCache();
         schemaReady = false;
         Sqlite.close();
     }
