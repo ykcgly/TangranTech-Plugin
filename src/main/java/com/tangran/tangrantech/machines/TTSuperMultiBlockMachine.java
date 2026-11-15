@@ -1,12 +1,14 @@
 package com.tangran.tangrantech.machines;
 
 import com.tangran.tangrantech.load.Read;
+import com.tangran.tangrantech.machines.superblock.SuperStructure;
 import io.github.thebusybiscuit.slimefun4.api.items.ItemGroup;
 import io.github.thebusybiscuit.slimefun4.api.items.SlimefunItem;
 import io.github.thebusybiscuit.slimefun4.api.items.SlimefunItemStack;
 import io.github.thebusybiscuit.slimefun4.api.recipes.RecipeType;
 import java.util.ArrayList;
 import java.util.List;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -37,6 +39,11 @@ public class TTSuperMultiBlockMachine extends TTRecipeMachine {
     private final int[] coreOffset;
     /** RSC 行为开关。 */
     private final SuperFlags flags;
+    /**
+     * 口木同款「结构构造器」：由上面三份 yml 数据在注册期一次性编译出的坐标表。
+     * 结构判定 / 缺块收集 / 投影建档全部只读它，字符矩阵本身不再参与运行期比对。
+     */
+    private final SuperStructure structureModel;
 
     public TTSuperMultiBlockMachine(ItemGroup group, SlimefunItemStack item, RecipeType rt, ItemStack[] recipe,
                                     int[] input, int[] output, List<TTRecipe> recipes,
@@ -48,6 +55,7 @@ public class TTSuperMultiBlockMachine extends TTRecipeMachine {
         this.mapping = mapping;
         this.coreOffset = coreOffset;
         this.flags = flags;
+        this.structureModel = SuperStructure.compile(structure, mapping, coreOffset);
         // 放置核心时记录玩家朝向（对齐 RSC BlockPlaceHandler + setHorizonDirection），
         // 结构匹配按该朝向旋转（SuperBlocks.onCorePlaced 持久化，重启不丢）
         addItemHandler(new io.github.thebusybiscuit.slimefun4.core.handlers.BlockPlaceHandler(false) {
@@ -76,6 +84,9 @@ public class TTSuperMultiBlockMachine extends TTRecipeMachine {
 
     /** 核心在结构中的相对偏移 {层, 行, 列}。 */
     public int[] getCoreOffset() { return coreOffset; }
+
+    /** 编译后的坐标表构造器（口木同款模型）；运行期所有结构判定都走它。 */
+    public SuperStructure structureModel() { return structureModel; }
 
     /**
      * 结构不完整就暂停生产：不扣电、不推进、不出货。
@@ -143,31 +154,16 @@ public class TTSuperMultiBlockMachine extends TTRecipeMachine {
     /**
      * 判定以 {@code core} 为核心的结构是否完整成形。
      *
-     * <p>比对规则：取出结构中每一格的期望物品，空（null 或 AIR）表示该格不限材质；
-     * 非空则要求方块类型一致——粘液物品按 id 比对，原版按材质比对。</p>
+     * <p>现在委托 {@link SuperStructure#isFormed}：坐标表在注册期编译一次，
+     * 比对规则仍是 {@link #matchesBlock}（粘液按 id、原版按材质、液体含 waterlogged），
+     * 但<b>会带上核心持久化朝向</b>旋转 —— 旧实现这里固定 NORTH，与
+     * {@code SuperBlocks} 的方向感知判定口径不一致，斜着搭的机器会出现
+     * 「管理器说成形、本方法说没成形」的分歧。</p>
      */
     public boolean isFormed(Block core) {
-        if (structure == null || structure.isEmpty()) return false;
-        if (coreOffset == null || coreOffset.length < 3) return false;
-        World w = core.getWorld();
-        for (int l = 0; l < structure.size(); l++) {
-            List<List<String>> rows = structure.get(l);
-            if (rows == null) continue;
-            for (int r = 0; r < rows.size(); r++) {
-                List<String> cols = rows.get(r);
-                if (cols == null) continue;
-                for (int c = 0; c < cols.size(); c++) {
-                    Expect expect = mapping.get(cols.get(c));
-                    if (expect == null || expect.material().isAir()) continue;
-                    Block actual = w.getBlockAt(
-                            core.getX() + (c - coreOffset[2]),
-                            core.getY() + (coreOffset[0] - l),
-                            core.getZ() + (r - coreOffset[1]));
-                    if (!matchesBlock(actual, expect)) return false;
-                }
-            }
-        }
-        return true;
+        if (structureModel == null || structureModel.isEmpty()) return false;
+        Location loc = core.getLocation();
+        return structureModel.isFormed(loc, SuperStructure.dirOf(loc));
     }
 
     /**
@@ -222,35 +218,16 @@ public class TTSuperMultiBlockMachine extends TTRecipeMachine {
     /**
      * 扫一遍结构，逐格给出「期望物品 + 现状」。
      *
-     * <p>与 {@link #isFormed(Block)} 用同一套坐标公式与比对规则，区别是不早退，
-     * 把所有格子的状态都收集出来。</p>
+     * <p>委托 {@link SuperStructure#scanCells}：与 {@link #isFormed(Block)} 用同一张坐标表、
+     * 同一朝向与同一比对规则，区别只是不早退。大型结构填充棒仍拿到原来的
+     * {@link Cell} 形状（四个字段完全不变），因此那边无需改动。</p>
      */
     public java.util.List<Cell> scanCells(Block core) {
         java.util.List<Cell> out = new ArrayList<>();
-        if (structure == null || structure.isEmpty()) return out;
-        if (coreOffset == null || coreOffset.length < 3) return out;
-
-        World w = core.getWorld();
-        for (int l = 0; l < structure.size(); l++) {
-            List<List<String>> rows = structure.get(l);
-            if (rows == null) continue;
-            for (int r = 0; r < rows.size(); r++) {
-                List<String> cols = rows.get(r);
-                if (cols == null) continue;
-                for (int c = 0; c < cols.size(); c++) {
-                    Expect expect = mapping.get(cols.get(c));
-                    // 与 isFormed 一致：空（null 或 AIR）表示该格不限材质，不参与比对
-                    if (expect == null || expect.material().isAir()) continue;
-
-                    Block actual = w.getBlockAt(
-                            core.getX() + (c - coreOffset[2]),
-                            core.getY() + (coreOffset[0] - l),
-                            core.getZ() + (r - coreOffset[1]));
-
-                    boolean ok = matchesBlock(actual, expect);
-                    out.add(new Cell(actual, expect.material(), expect.sfId(), ok));
-                }
-            }
+        if (structureModel == null) return out;
+        Location loc = core.getLocation();
+        for (SuperStructure.Cell c : structureModel.scanCells(loc, SuperStructure.dirOf(loc))) {
+            out.add(new Cell(c.location().getBlock(), c.wantMaterial(), c.expectSfId(), c.ok()));
         }
         return out;
     }

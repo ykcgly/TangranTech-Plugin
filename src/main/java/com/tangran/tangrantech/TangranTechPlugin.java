@@ -112,6 +112,12 @@ public final class TangranTechPlugin extends JavaPlugin implements SlimefunAddon
         } catch (Throwable ignored) {
             // 同上
         }
+        // 清掉超多方块的分层投影与红色缺块提示实体（/reload、热卸载时实体仍活着）
+        try {
+            com.tangran.tangrantech.machines.superblock.SuperBlocks.shutdown();
+        } catch (Throwable ignored) {
+            // 同上
+        }
         getLogger().info("糖然科技 已卸载");
     }
 

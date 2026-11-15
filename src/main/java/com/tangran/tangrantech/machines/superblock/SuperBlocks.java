@@ -204,6 +204,52 @@ public final class SuperBlocks implements Listener {
         Bukkit.getPluginManager().registerEvents(new SuperBlocks(), TT.plugin);
         // 脏队列逐刻清空（RSC 用异步任务，我们同步处理——单格检查开销极小，同步更简单安全）
         Bukkit.getScheduler().runTaskTimer(TT.plugin, SuperBlocks::drainDirty, 1L, 1L);
+        // 升级前的投影实体是 persistent=true 的，会随区块写进世界存档 —— 启动后清一次。
+        // 只删「仍然 persistent 且带本插件标记」的：本轮新建的投影已 setPersistent(false)，
+        // 不会被误删（20 tick 后很可能已有机器建档并生成了新投影）。
+        Bukkit.getScheduler().runTaskLater(TT.plugin, SuperBlocks::sweepLegacyDisplays, 20L);
+    }
+
+    /** 清掉上一版写进存档的持久化投影实体；返回清理数量。 */
+    private static void sweepLegacyDisplays() {
+        int n = 0;
+        for (World w : Bukkit.getWorlds()) {
+            try {
+                for (Display d : w.getEntitiesByClass(Display.class)) {
+                    if (!d.isPersistent()) continue;   // 本轮新建的一律跳过
+                    if (!d.getPersistentDataContainer().has(DISPLAY_KEY, PersistentDataType.BOOLEAN)) continue;
+                    clearGlowTeam(d);
+                    if (d.isValid()) d.remove();
+                    n++;
+                }
+            } catch (Throwable t) {
+                TT.log("[超多方块] 启动清理历史投影失败: " + t);
+            }
+        }
+        if (n > 0) TT.log("[超多方块] 启动清理历史投影实体 " + n + " 个（旧版 persistent 残留）");
+    }
+
+    /**
+     * 插件停用：清掉全部投影实体（含缺块提示）并清空内存索引。
+     *
+     * <p>由 {@code TangranTechPlugin.onDisable()} 在主线程调用。投影已 setPersistent(false)，
+     * 正常关服本就会被回收，这里仍显式清一遍，覆盖 /reload 与插件管理器热卸载
+     * （服务器没重启、实体还活着的场景）。</p>
+     */
+    public static void shutdown() {
+        for (Inst inst : new java.util.ArrayList<>(CORE.values())) {
+            for (Map.Entry<Location, Display> en : inst.projectiles.entrySet()) {
+                Display d = en.getValue();
+                clearGlowTeam(d);
+                if (d != null && d.isValid()) d.remove();
+            }
+            inst.projectiles.clear();
+        }
+        CORE.clear();
+        MONITOR.clear();
+        FIRST_TICKS.clear();
+        DIRTY.clear();
+        TTStructureMissingHint.shutdown();
     }
 
     /** 核心被放置：记录玩家朝向（持久化，重启不丢）。 */
@@ -268,13 +314,8 @@ public final class SuperBlocks implements Listener {
     // ==================================================================
 
     private static void tryStart(TTSuperMultiBlockMachine machine, Location core) {
-        Dir dir;
-        try {
-            String s = StorageCacheUtils.getData(core, "TTHorizonDirection");
-            dir = (s == null || s.isEmpty()) ? Dir.NORTH : Dir.valueOf(s);
-        } catch (Throwable t) {
-            dir = Dir.NORTH;
-        }
+        // 朝向读取统一收口到 SuperStructure.dirOf（机器类的 isFormed/scanCells 也读它，口径一致）
+        Dir dir = SuperStructure.dirOf(core);
 
         Inst inst = buildInst(machine, core, dir);
         if (inst == null) return;
@@ -320,32 +361,17 @@ public final class SuperBlocks implements Listener {
         });
     }
 
-    /** 从机器的结构/mapping/核心偏移构建旋转后的实例（坐标公式与旧 isFormed 一致）。 */
+    /**
+     * 从机器注册期编译好的 {@link SuperStructure} 坐标表构建旋转后的实例。
+     *
+     * <p>原先这里每次建档都要重新遍历一遍「层 → 行 → 列」字符矩阵并查 mapping，
+     * 与 {@code TTSuperMultiBlockMachine.isFormed/scanCells} 各自维护一套坐标公式；
+     * 现在三处统一消费同一张坐标表（旋转、核心排除、通配格规则全在构造器里定死）。</p>
+     */
     private static Inst buildInst(TTSuperMultiBlockMachine machine, Location core, Dir dir) {
-        List<List<List<String>>> structure = machine.getStructure();
-        Map<String, TTSuperMultiBlockMachine.Expect> mapping = machine.getMapping();
-        int[] coreOffset = machine.getCoreOffset();
-        if (structure == null || structure.isEmpty() || mapping == null || coreOffset == null) return null;
-
-        Map<Off, TTSuperMultiBlockMachine.Expect> cells = new java.util.LinkedHashMap<>();
-        for (int l = 0; l < structure.size(); l++) {
-            List<List<String>> rows = structure.get(l);
-            if (rows == null) continue;
-            for (int r = 0; r < rows.size(); r++) {
-                List<String> cols = rows.get(r);
-                if (cols == null) continue;
-                for (int c = 0; c < cols.size(); c++) {
-                    // 核心本身不进结构格（对齐 RSC blockParts.remove(corePos)）
-                    if (l == coreOffset[0] && r == coreOffset[1] && c == coreOffset[2]) continue;
-                    TTSuperMultiBlockMachine.Expect expect = mapping.get(cols.get(c));
-                    if (expect == null || expect.material().isAir()) continue;   // "__" 通配
-                    int dx = c - coreOffset[2];
-                    int dy = coreOffset[0] - l;
-                    int dz = r - coreOffset[1];
-                    cells.put(new Off(dir.rx(dx, dy, dz), dy, dir.rz(dx, dy, dz)), expect);
-                }
-            }
-        }
+        SuperStructure model = machine.structureModel();
+        if (model == null || model.isEmpty()) return null;
+        Map<Off, TTSuperMultiBlockMachine.Expect> cells = model.cells(dir);
         if (cells.isEmpty()) return null;
         return new Inst(machine, core, dir, cells);
     }
@@ -357,13 +383,23 @@ public final class SuperBlocks implements Listener {
         CORE.remove(inst.core);
         FIRST_TICKS.remove(inst.core);
         removeProjectiles(inst);
+        // 核心没了，红色缺块提示也必须一起撤（含孤儿实体兜底扫描）
+        runSync(() -> TTStructureMissingHint.clear(inst.core));
     }
 
     // ==================================================================
     // 逐格检测（对齐 RSC processDirty）
     // ==================================================================
 
+    private static int sweepTicks;
+
     private static void drainDirty() {
+        // 每 30 秒兜底扫一遍「核心是否还在」：爆炸 / 活塞 / 其它插件移除核心时不会走
+        // Slimefun 的 BlockBreakHandler，CORE/MONITOR 和投影实体会一起泄漏（残留来源之一）。
+        if (++sweepTicks >= 600) {
+            sweepTicks = 0;
+            try { sweepDeadCores(); } catch (Throwable ignored) { }
+        }
         Dirty d;
         while ((d = DIRTY.poll()) != null) {
             try {
@@ -371,6 +407,24 @@ public final class SuperBlocks implements Listener {
             } catch (Throwable t) {
                 TT.log("[超多方块] 脏格子处理出错: " + t);
             }
+        }
+    }
+
+    /** 核心已不是本机器方块时收掉实例（含投影、缺块提示与 MONITOR 索引）。 */
+    private static void sweepDeadCores() {
+        if (CORE.isEmpty()) return;
+        for (Inst inst : new java.util.ArrayList<>(CORE.values())) {
+            Location core = inst.core;
+            World w = core.getWorld();
+            if (w == null) continue;
+            // 区块未加载时 BlockStorage 可能读不到，暂不判定，等加载后再说
+            if (!w.isChunkLoaded(core.getBlockX() >> 4, core.getBlockZ() >> 4)) continue;
+            String id = com.tangran.tangrantech.native_scripts.SlimefunBridge.blockId(core.getBlock());
+            // id 读不到时不能直接判定「核心没了」——BlockStorage 缓存未命中也会返回 null。
+            // 只有「明确是别的方块」或「id 为空且方块材质也换了」才销毁，避免每 30 秒误重建。
+            boolean replaced = id != null && !id.equalsIgnoreCase(inst.machine.getId());
+            boolean gone = id == null && core.getBlock().getType() != inst.machine.getItem().getType();
+            if (replaced || gone) destroy(inst);
         }
     }
 
@@ -411,6 +465,7 @@ public final class SuperBlocks implements Listener {
         } else if (!before && now) {
             inst.formed = true;
             noticeFormed(inst);
+            TTStructureMissingHint.clear(inst.core);   // 齐了就撤掉红色缺块提示
             if (inst.machine.flags().displayProjectiles()) removeProjectiles(inst);
         }
     }
@@ -446,16 +501,27 @@ public final class SuperBlocks implements Listener {
             boolean before = inst.formed;
             if (now == before) {
                 if (!now && ++inst.rescanCount % 5 == 0) {
+                    // 口木同款 checkStructure：给出第一处缺失的具体坐标与期望物品，
+                    // 比只报「N/M 格就位」更利于排查（低频：约每 200 tick 一次）
+                    String first = "无";
+                    try {
+                        SuperStructure.StructureCheck chk = inst.machine.structureModel()
+                                .checkStructure(inst.core, inst.dir);
+                        if (!chk.errors().isEmpty()) first = chk.errors().get(0);
+                    } catch (Throwable ignored) {
+                        // 诊断信息拿不到不影响主流程
+                    }
                     TT.log("[超多方块] " + inst.machine.getId() + " @"
                             + inst.core.getBlockX() + "," + inst.core.getBlockY() + "," + inst.core.getBlockZ()
                             + " 仍未成形: " + inst.correct.size() + "/" + inst.cellLocs.size()
-                            + " 格就位（发光方块为缺失格）");
+                            + " 格就位（发光方块为缺失格）; 首处缺失: " + first);
                 }
                 return;
             }
             inst.formed = now;
             if (now) {
                 noticeFormed(inst);
+                TTStructureMissingHint.clear(inst.core);
                 if (inst.machine.flags().displayProjectiles()) removeProjectiles(inst);
             } else {
                 if (inst.machine.flags().defaultNotice()) {
@@ -510,6 +576,13 @@ public final class SuperBlocks implements Listener {
 
         TTSuperMultiBlockMachine.SuperFlags flags = inst.machine.flags();
         boolean formed = inst.formed;
+
+        // 口木同款缺块提示：右键未成形的核心 → 一次性标出全部缺失格（红色发光 + 名称牌
+        // + 聊天栏绝对坐标），放对方块自动消失。放在切层分支之前，保证无论是否切层都会执行。
+        if (clickedCore && !formed && inst.machine.structureModel() != null) {
+            TTStructureMissingHint.showMissing(p, inst.core,
+                    inst.machine.structureModel().collectMissing(inst.core, inst.dir));
+        }
 
         // 未成形 + 点核心 + 允许换层：右键（noMenuWhenNotFormed 时）切换投影层；潜行=向下
         if (flags.allowSwitchDisplayLayer() && !formed && clickedCore) {
@@ -653,24 +726,43 @@ public final class SuperBlocks implements Listener {
     private static Display createDisplay(World w, Location l, TTSuperMultiBlockMachine.Expect expect) {
         if (expect.sfId() != null) return null;
         Material m = expect.material();
-        Display d = null;
+        Display d;
         if (m == Material.WATER || m == Material.LAVA) {
             ItemStack icon = new ItemStack(m == Material.WATER ? Material.WATER_BUCKET : Material.LAVA_BUCKET);
-            ItemDisplay item = (ItemDisplay) w.spawnEntity(l, EntityType.ITEM_DISPLAY);
-            item.setItemStack(icon);
-            item.setItemDisplayTransform(ItemDisplay.ItemDisplayTransform.FIXED);
-            d = item;
+            d = w.spawn(l, ItemDisplay.class, item -> {
+                item.setItemStack(icon);
+                item.setItemDisplayTransform(ItemDisplay.ItemDisplayTransform.FIXED);
+                applyCommonDisplayFlags(item);
+            });
         } else if (m.isBlock()) {
-            BlockDisplay block = (BlockDisplay) w.spawnEntity(l, EntityType.BLOCK_DISPLAY);
-            block.setBlock(m.createBlockData());
-            d = block;
+            d = w.spawn(l, BlockDisplay.class, block -> {
+                block.setBlock(m.createBlockData());
+                applyCommonDisplayFlags(block);
+            });
+        } else {
+            return null;
         }
-        if (d == null) return null;
         d.setTransformation(visibleTransformation(d));
-        d.getPersistentDataContainer().set(DISPLAY_KEY, PersistentDataType.BOOLEAN, true);
-        d.setBrightness(new Display.Brightness(15, 15));
-        d.setCustomNameVisible(false);
         return d;
+    }
+
+    /**
+     * 口木 {@code StructureProjectionHelper} 同款的统一实体属性。
+     *
+     * <p><b>{@code setPersistent(false)} 是防「投影实体残留」的关键</b>：Bukkit 的 Display
+     * 默认 persistent=true，会随区块写进世界存档；服务器重启后 {@code CORE / MONITOR /
+     * inst.projectiles} 三张内存表全空，旧投影没人认领也没人删，就永久留在原地。
+     * 关掉持久化后重启由服务端自然回收，{@link #findAdoptable} 只用于插件 reload
+     * （服务器没重启、实体还活着）的兜底。</p>
+     */
+    private static void applyCommonDisplayFlags(Display d) {
+        d.getPersistentDataContainer().set(DISPLAY_KEY, PersistentDataType.BOOLEAN, true);
+        d.setPersistent(false);
+        d.setBrightness(new Display.Brightness(15, 15));
+        d.setViewRange(64.0F);
+        d.setGravity(false);
+        d.setInvulnerable(true);
+        d.setCustomNameVisible(false);
     }
 
     /** 「可见」状态的变换：方块投影 0.8 格居中，物品（水桶）投影放大到半格。 */
@@ -716,7 +808,10 @@ public final class SuperBlocks implements Listener {
         TTSuperMultiBlockMachine.Expect expect = expectOf(inst, loc);
         if (expect == null) return;
         if (d == null || !d.isValid()) {
-            d = createDisplay(loc.getWorld(), loc, expect);
+            // 先收养世界里已有的同格投影：插件 reload / 实例重建后 projectiles 是空的，
+            // 直接 createDisplay 会叠出第二套实体 —— 这是「投影实体残留」的一个真实来源。
+            d = findAdoptable(loc.getWorld(), loc);
+            if (d == null) d = createDisplay(loc.getWorld(), loc, expect);
             if (d == null) return;
             inst.projectiles.put(loc, d);
             applyLayerVisibility(inst, loc, d);
